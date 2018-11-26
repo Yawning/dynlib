@@ -25,6 +25,7 @@ package dynlib
 
 import (
 	"bytes"
+	"debug/elf"
 	"encoding/binary"
 	"fmt"
 	"io/ioutil"
@@ -32,6 +33,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 )
 
 const (
@@ -116,17 +118,13 @@ func (c *Cache) ResolveLibraries(binaries []string, extraLibs []string, ldLibrar
 			if err != nil {
 				return nil, err
 			}
-			if Debugf != nil {
-				Debugf("dynlib: %v imports: %v", fn, impLibs)
-			}
+			debugf("dynlib: %v imports: %v", fn, impLibs)
 			checkedFile[fn] = true
 
 			// The internal libraries also need recursive resolution,
 			// so just append them to the first binary.
 			if extraLibs != nil {
-				if Debugf != nil {
-					Debugf("dynlib: Appending extra libs: %v", extraLibs)
-				}
+				debugf("dynlib: Appending extra libs: %v", extraLibs)
 				impLibs = append(impLibs, extraLibs...)
 				extraLibs = nil
 			}
@@ -168,9 +166,7 @@ func (c *Cache) ResolveLibraries(binaries []string, extraLibs []string, ldLibrar
 				case inFallbackPath:
 					libSrc = "Filesystem"
 				}
-				if Debugf != nil {
-					Debugf("dynlib: Found %v (%v).", lib, libSrc)
-				}
+				debugf("dynlib: Found %v (%v).", lib, libSrc)
 
 				// Register the library, assuming it's not in what will
 				// presumably be `LD_LIBRARY_PATH` inside the hugbox.
@@ -279,21 +275,32 @@ func getNewLdCache(b []byte) ([]byte, int, error) {
 	return b[padLen:], nlibs, nil
 }
 
-// LoadCache loads and parses the `ld.so.cache` file.
+// LoadCache creates a new system shared library cache usually by loading
+// and parsing the `/etc/ld.so.cache` file.
 //
 // See `sysdeps/generic/dl-cache.h` in the glibc source tree for details
 // regarding the format.
 func LoadCache() (*Cache, error) {
-	const entrySz = 4 + 4 + 4 + 4 + 8
-
 	if !IsSupported() {
 		return nil, errUnsupported
 	}
 
-	ourOsVersion := getOsVersion()
-	if Debugf != nil {
-		Debugf("dynlib: osVersion: %08x", ourOsVersion)
+	// Certain libc implementations totally lack a ld.so.cache.
+	_, err := os.Stat(ldSoCache)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return loadCacheFallback()
+		}
 	}
+
+	return loadCacheGlibc()
+}
+
+func loadCacheGlibc() (*Cache, error) {
+	const entrySz = 4 + 4 + 4 + 4 + 8
+
+	ourOsVersion := getOsVersion()
+	debugf("dynlib: osVersion: %08x", ourOsVersion)
 
 	c := new(Cache)
 	c.store = make(map[string]cacheEntries)
@@ -381,21 +388,15 @@ func LoadCache() (*Cache, error) {
 		// Discard libraries we have no hope of using, either due to
 		// osVersion, or hwcap.
 		if ourOsVersion < e.osVersion {
-			if Debugf != nil {
-				Debugf("dynlib: ignoring library: %v (osVersion: %x)", e.key, e.osVersion)
-			}
+			debugf("dynlib: ignoring library: %v (osVersion: %x)", e.key, e.osVersion)
 		} else if err = ValidateLibraryClass(e.value); err != nil {
-			if Debugf != nil {
-				Debugf("dynlib: ignoring library %v (%v)", e.key, err)
-			}
+			debugf("dynlib: ignoring library %v (%v)", e.key, err)
 		} else if flagCheckFn(e.flags) {
 			vec := c.store[e.key]
 			vec = append(vec, e)
 			c.store[e.key] = vec
 		} else {
-			if Debugf != nil {
-				Debugf("dynlib: ignoring library: %v (flags: %x, hwcap: %x)", e.key, e.flags, e.hwcap)
-			}
+			debugf("dynlib: ignoring library: %v (flags: %x, hwcap: %x)", e.key, e.flags, e.hwcap)
 		}
 	}
 
@@ -414,12 +415,115 @@ func LoadCache() (*Cache, error) {
 			paths = append(paths, e.value)
 		}
 
-		if Debugf != nil {
-			Debugf("dynlib: debug: Multiple entry: %v: %v", lib, paths)
+		debugf("dynlib: debug: Multiple entry: %v: %v", lib, paths)
+	}
+
+	return c, nil
+}
+
+func loadCacheFallback() (*Cache, error) {
+	c := new(Cache)
+	c.store = make(map[string]cacheEntries)
+
+	// The only reason this exists is because some people think that using
+	// musl-libc is a good idea, so it is tailored for such systems.
+	machine, searchPaths := archDepsMusl()
+
+	for _, path := range searchPaths {
+		fis, err := ioutil.ReadDir(path)
+		if err != nil {
+			debugf("dynlib: failed to read directory '%v': %v", path, err)
+			continue
+		}
+
+		for _, v := range fis {
+			// Skip directories.
+			if v.IsDir() {
+				continue
+			}
+
+			fn := filepath.Join(path, v.Name())
+			soname, err := getSoname(fn, machine)
+			if err != nil {
+				debugf("dynlib: ignoring file '%v': %v", fn, err)
+				continue
+			}
+
+			e := &cacheEntry{
+				key:   soname,
+				value: fn,
+			}
+
+			vec := c.store[e.key]
+			vec = append(vec, e)
+			c.store[e.key] = vec
 		}
 	}
 
 	return c, nil
+}
+
+func getSoname(path string, machine elf.Machine) (string, error) {
+	f, err := elf.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	if f.Machine != machine {
+		return "", fmt.Errorf("machine mismatch (%v)", f.Machine)
+	}
+
+	soNames, err := f.DynString(elf.DT_SONAME)
+	if err != nil {
+		return "", err
+	}
+	if len(soNames) < 1 {
+		return "", fmt.Errorf("no DT_SONAME entry")
+	}
+
+	return soNames[0], nil
+}
+
+func archDepsMusl() (elf.Machine, []string) {
+	var (
+		pathFile  string
+		machine   elf.Machine
+		archPaths []string
+	)
+
+	switch runtime.GOARCH {
+	case "amd64":
+		machine = elf.EM_X86_64
+		pathFile = "/etc/ld-musl-x86_64.path"
+		archPaths = []string{
+			"/lib64",
+			"/usr/lib64",
+		}
+	default:
+		panic(errUnsupported)
+	}
+
+	// Try to load `/etc/ld-musl-{LDSO_ARCH}.path`.
+	b, err := ioutil.ReadFile(pathFile)
+	switch err {
+	case nil:
+		return machine, strings.FieldsFunc(string(b), func(c rune) bool {
+			return c == '\n' || c == ':'
+		})
+	default:
+		debugf("dynlib: failed to read '%v': %v", pathFile, err)
+	}
+
+	searchPaths := []string{
+		// musl's default library search paths.
+		"/lib",
+		"/usr/local/lib",
+		"/usr/lib",
+	}
+	searchPaths = append(searchPaths, archPaths...)
+
+	return machine, searchPaths
 }
 
 func fileExists(f string) bool {
@@ -430,4 +534,10 @@ func fileExists(f string) bool {
 		return false
 	}
 	return true
+}
+
+func debugf(fmt string, args ...interface{}) {
+	if Debugf != nil {
+		Debugf(fmt, args...)
+	}
 }
