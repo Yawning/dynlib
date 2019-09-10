@@ -44,8 +44,19 @@ const (
 	flagElfLibc6 = 3
 )
 
-// Debugf is a hook used for redirecting debug output.
-var Debugf func(string, ...interface{})
+var (
+	// Debugf is a hook used for redirecting debug output.
+	Debugf func(string, ...interface{})
+
+	cacheMagic = []byte{
+		'l', 'd', '.', 's', 'o', '-', '1', '.', '7', '.', '0', 0,
+	}
+
+	cacheMagicNew = []byte{
+		'g', 'l', 'i', 'b', 'c', '-', 'l', 'd', '.', 's', 'o', '.', 'c', 'a', 'c',
+		'h', 'e', '1', '.', '1',
+	}
+)
 
 // FilterFunc is a function that implements a filter to allow rejecting
 // dependencies when resolving libraries.
@@ -181,7 +192,7 @@ func (c *Cache) ResolveLibraries(binaries []string, extraLibs []string, ldLibrar
 			}
 		}
 		toCheck = []string{}
-		for k, _ := range newToCheck {
+		for k := range newToCheck {
 			toCheck = append(toCheck, k)
 		}
 	}
@@ -235,25 +246,22 @@ func (e cacheEntries) Swap(i, j int) {
 	e[i], e[j] = e[j], e[i]
 }
 
-func getNewLdCache(b []byte) ([]byte, int, error) {
+func parseOldLdCache(b []byte) ([]byte, error) {
 	const entrySz = 4 + 4 + 4
 
 	// The new format is embedded in the old format, so do some light
 	// parsing/validation to get to the new format's header.
-	cacheMagic := []byte{
-		'l', 'd', '.', 's', 'o', '-', '1', '.', '7', '.', '0', 0,
-	}
 
 	// old_magic
 	if !bytes.HasPrefix(b, cacheMagic) {
-		return nil, 0, fmt.Errorf("dynlib: ld.so.cache has invalid old_magic")
+		return nil, fmt.Errorf("dynlib: ld.so.cache has invalid old_magic")
 	}
 	off := len(cacheMagic)
 	b = b[off:]
 
 	// nlibs
 	if len(b) < 4 {
-		return nil, 0, fmt.Errorf("dynlib: ld.so.cache truncated (nlibs)")
+		return nil, fmt.Errorf("dynlib: ld.so.cache truncated (nlibs)")
 	}
 	nlibs := int(binary.LittleEndian.Uint32(b))
 	off += 4
@@ -262,7 +270,7 @@ func getNewLdCache(b []byte) ([]byte, int, error) {
 	// libs[nlibs]
 	nSkip := entrySz * nlibs
 	if len(b) < nSkip {
-		return nil, 0, fmt.Errorf("dynlib: ld.so.cache truncated (libs[])")
+		return nil, fmt.Errorf("dynlib: ld.so.cache truncated (libs[])")
 	}
 	off += nSkip
 	b = b[nSkip:]
@@ -270,9 +278,28 @@ func getNewLdCache(b []byte) ([]byte, int, error) {
 	// new_magic is 8 byte aligned.
 	padLen := (((off+8-1)/8)*8 - off)
 	if len(b) < padLen {
-		return nil, 0, fmt.Errorf("dynlib: ld.so.cache truncated (pad)")
+		return nil, fmt.Errorf("dynlib: ld.so.cache truncated (pad)")
 	}
-	return b[padLen:], nlibs, nil
+	return b[padLen:], nil
+}
+
+func getNewLdCache(b []byte) ([]byte, error) {
+	// This is either just the new format, or the old format embedding
+	// the new format (under the assumption that no one is using a
+	// version of glibc older than 2.2).
+	if !bytes.HasPrefix(b, cacheMagicNew) {
+		// Probably the old format, try parsing the header to find the
+		// embedded new format.
+		var err error
+		if b, err = parseOldLdCache(b); err != nil {
+			return nil, err
+		}
+		if !bytes.HasPrefix(b, cacheMagicNew) {
+			return nil, fmt.Errorf("dynlib: ld.so.cache has invalid new_magic")
+		}
+	}
+
+	return b, nil
 }
 
 // LoadCache creates a new system shared library cache usually by loading
@@ -310,22 +337,13 @@ func loadCacheGlibc() (*Cache, error) {
 		return nil, err
 	}
 
-	// It is likely safe to assume that everyone is running glibc >= 2.2 at
-	// this point, so extract the "new format" from the "old format".
-	b, _, err = getNewLdCache(b)
-	if err != nil {
+	if b, err = getNewLdCache(b); err != nil {
 		return nil, err
 	}
+
 	stringTable := b
 
 	// new_magic.
-	cacheMagicNew := []byte{
-		'g', 'l', 'i', 'b', 'c', '-', 'l', 'd', '.', 's', 'o', '.', 'c', 'a', 'c',
-		'h', 'e', '1', '.', '1',
-	}
-	if !bytes.HasPrefix(b, cacheMagicNew) {
-		return nil, fmt.Errorf("dynlib: ld.so.cache has invalid new_magic")
-	}
 	b = b[len(cacheMagicNew):]
 
 	// nlibs, len_strings, unused[].
@@ -363,7 +381,7 @@ func loadCacheGlibc() (*Cache, error) {
 		}
 		// HWCAP is unused on amd64.
 	default:
-		panic(errUnsupported)
+		return nil, errUnsupported
 	}
 
 	for i := 0; i < nlibs; i++ {
