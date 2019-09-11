@@ -445,7 +445,10 @@ func loadCacheFallback() (*Cache, error) {
 
 	// The only reason this exists is because some people think that using
 	// musl-libc is a good idea, so it is tailored for such systems.
-	machine, searchPaths := archDepsMusl()
+	machine, searchPaths, err := archDepsMusl()
+	if err != nil {
+		return nil, err
+	}
 
 	for _, path := range searchPaths {
 		fis, err := ioutil.ReadDir(path)
@@ -503,7 +506,7 @@ func getSoname(path string, machine elf.Machine) (string, error) {
 	return soNames[0], nil
 }
 
-func archDepsMusl() (elf.Machine, []string) {
+func archDepsMusl() (elf.Machine, []string, error) {
 	var (
 		pathFile  string
 		machine   elf.Machine
@@ -519,7 +522,7 @@ func archDepsMusl() (elf.Machine, []string) {
 			"/usr/lib64",
 		}
 	default:
-		panic(errUnsupported)
+		return elf.EM_NONE, nil, errUnsupported
 	}
 
 	// Try to load `/etc/ld-musl-{LDSO_ARCH}.path`.
@@ -528,7 +531,7 @@ func archDepsMusl() (elf.Machine, []string) {
 	case nil:
 		return machine, strings.FieldsFunc(string(b), func(c rune) bool {
 			return c == '\n' || c == ':'
-		})
+		}), nil
 	default:
 		debugf("dynlib: failed to read '%v': %v", pathFile, err)
 	}
@@ -541,7 +544,7 @@ func archDepsMusl() (elf.Machine, []string) {
 	}
 	searchPaths = append(searchPaths, archPaths...)
 
-	return machine, searchPaths
+	return machine, searchPaths, nil
 }
 
 func fileExists(f string) bool {
